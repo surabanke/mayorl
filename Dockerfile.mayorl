@@ -1,0 +1,105 @@
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/root/.cache/huggingface
+# 원본 envs.py가 import하는 OpenAI `baselines`를 대체하는 mayorl shim 경로.
+# (실제 baselines+TF 스택은 py3.10에서 무겁고 호환이 어려워 sb3 재노출 shim 사용)
+ENV PYTHONPATH=/usr/src/app/mayorl/_shim
+
+# ─── 시스템 패키지 ────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-dev \
+    libgtk-3-dev \
+    gir1.2-gtk-3.0 \
+    libgirepository1.0-dev \
+    python3-gi \
+    python3-gi-cairo \
+    libgdk-pixbuf2.0-0 \
+    libcairo2-dev \
+    python3-cairo-dev \
+    swig \
+    git \
+    make \
+    gcc \
+    g++ \
+    xvfb \
+    libxdamage1 \
+    libxfixes3 \
+    && apt-get install --reinstall -y libxdamage1 libxfixes3 \
+    && rm -rf /var/lib/apt/lists/* \
+    # swig3.0 심볼릭 링크 (Makefile이 swig3.0 명시적으로 호출)
+    && ln -s /usr/bin/swig /usr/bin/swig3.0 \
+    # pycairo 1.20의 Pycairo_CAPI 전역 심볼 → static으로 패치 (multiple definition 방지)
+    && sed -i \
+       's/Pycairo_CAPI_t \*Pycairo_CAPI;/static Pycairo_CAPI_t *Pycairo_CAPI;/g' \
+       /usr/include/pycairo/py3cairo.h
+
+# ─── Python 빌드 도구 ─────────────────────────────────────────────────────────
+# setuptools: setup.py install / distutils 호환성
+# meson/ninja: pygobject(3.5x)는 meson-python 빌드 백엔드를 쓰므로 필요.
+#   (apt의 meson은 구버전이라 meson-python과 불일치 → pip로 최신 설치)
+# pygobject<3.52: 3.52+는 glib 2.80의 girepository-2.0을 요구하지만 Ubuntu 22.04는
+#   girepository-1.0만 제공한다. 3.50.x가 girepository-1.0 호환 마지막 계열.
+#   (핀이 없으면 latest가 끌려와 'girepository-2.0 not found'로 빌드 실패)
+# --force-reinstall: system gi와 버전 불일치 시 segfault 방지
+RUN pip3 install --no-cache-dir setuptools wheel meson ninja \
+    && pip3 install --no-cache-dir --upgrade --force-reinstall "pygobject<3.52"
+
+# ─── PyTorch (CUDA 12.1) ─────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# ─── RL 인프라 ───────────────────────────────────────────────────────────────
+# gym 0.21: 원본 코드가 의존하는 버전
+# stable-baselines3 1.7.0: gym<0.26 호환 마지막 버전 (2.x는 gymnasium 필요)
+RUN pip3 install --no-cache-dir \
+    "gym==0.21.0" \
+    "stable-baselines3==1.7.0" \
+    numpy
+
+# ─── 원본 코드 런타임 의존성 ──────────────────────────────────────────────────
+# opencv: gym_city/wrappers.py 의 `import cv2`
+# torchsummary: 원본 model.py
+# shimmy: 이미지의 sb3가 2.x로 올라가 gym 0.21 환경 래핑에 필요
+RUN pip3 install --no-cache-dir \
+    opencv-python-headless \
+    torchsummary \
+    "shimmy>=2.0"
+
+# ─── Qwen2.5-VL 스택 (text-only LLM 모드) ────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    "transformers>=4.49.0" \
+    accelerate \
+    bitsandbytes \
+    qwen-vl-utils \
+    einops
+
+# ─── 소스 복사 ───────────────────────────────────────────────────────────────
+WORKDIR /usr/src/app
+COPY . ./
+
+# ─── Makefile 패치: Python 3.6 시절 .so 이름 하드코딩 수정 ──────────────────
+# src/makefile 112, 122, 132번 줄에 cpython-36m-x86_64-linux-gnu 고정값 존재
+# Python 3.10 실제 EXT_SUFFIX: cpython-310-x86_64-linux-gnu
+RUN SUFFIX=$(python3 -c \
+      "import sysconfig; s=sysconfig.get_config_var('EXT_SUFFIX'); print(s[1:-3])") && \
+    find gym_city/envs/micropolis/MicropolisCore/src -name 'makefile' | \
+        xargs sed -i "s/cpython-36m-x86_64-linux-gnu/${SUFFIX}/g"
+
+# ─── Micropolis 빌드 ──────────────────────────────────────────────────────────
+RUN make clean && \
+    mkdir -p gym_city/envs/micropolis/MicropolisCore/src/TileEngine/objs && \
+    mkdir -p gym_city/envs/micropolis/MicropolisCore/src/CellEngine/objs && \
+    mkdir -p gym_city/envs/micropolis/MicropolisCore/src/MicropolisEngine/objs && \
+    make && make install
+
+# ─── 실행 ────────────────────────────────────────────────────────────────────
+CMD ["xvfb-run", "-a", "python3", "-m", "mayorl.train", \
+     "--algo", "ppo", \
+     "--map-width", "16", \
+     "--num-processes", "1", \
+     "--use-vlm", \
+     "--vlm-eval-every", "20"]
