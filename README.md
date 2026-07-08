@@ -4,10 +4,6 @@ MayoRL is a research workspace for reinforcement learning on the Micropolis
 city simulator. The current target is a mayor agent that must manage a city
 under real budget and tax constraints instead of unlimited construction funds.
 
-This repository is a mutable working copy. The preserved upstream reference is
-kept outside this tree as `gym-city-origin/`; this repository may diverge from
-that source while MayoRL is made self-contained.
-
 ## Usage
 
 Micropolis depends on native GTK/engine components, so the supported runtime is
@@ -109,8 +105,3 @@ This repository contains code under multiple open-source licenses.
   under the GNU GPL, version 3 or later, with additional terms from the original
   Micropolis release. Keep those copyright and license notices with any shared
   copy or modified version.
-
-Rewriting the Git history does not remove license, copyright, or attribution
-obligations. Modified versions should remain identifiable as modified, and this
-project does not claim SimCity, Micropolis, Electronic Arts, or Maxis trademark
-rights.
